@@ -194,7 +194,11 @@ public class NIOSSLHandler : ChannelInboundHandler, ChannelOutboundHandler, Remo
     public func write(context: ChannelHandlerContext, data: NIOAny, promise: EventLoopPromise<Void>?) {
         bufferWrite(data: unwrapOutboundIn(data), promise: promise)
     }
-
+    
+    public func flush() {
+        self.flush(context: storedContext!)
+    }
+    
     public func flush(context: ChannelHandlerContext) {
         switch self.state {
         case .idle, .handshaking, .additionalVerification:
