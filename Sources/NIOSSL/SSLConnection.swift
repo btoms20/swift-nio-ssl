@@ -53,7 +53,27 @@ internal final class SSLConnection {
     private var verificationCallback: NIOSSLVerificationCallback?
     internal var customVerificationManager: CustomVerifyManager?
     internal var customPrivateKeyResult: Result<ByteBuffer, Error>?
-
+    
+    enum Errors:Error {
+        case invalidQuicCryptoFrame
+    }
+    
+    internal var epoch:ssl_encryption_level_t = ssl_encryption_initial
+    private var mode:NIOSSLContext.OperatingMode {
+        self.parentContext.mode
+    }
+    internal var isQuic:Bool {
+        self.parentContext.mode.isQuic
+    }
+    private var quicMethods = SSL_QUIC_METHOD(
+        set_read_secret: { SSLConnection.setReadSecret($0, $1, $2, $3, $4) },
+        set_write_secret: { SSLConnection.setWriteSecret($0, $1, $2, $3, $4) },
+        add_handshake_data: { SSLConnection.addHandshakeData($0, $1, $2, $3) },
+        flush_flight: { SSLConnection.flushFlight($0) },
+        send_alert: { SSLConnection.sendAlert($0, $1, $2) }
+    )
+    internal var outboundQueue:ByteBuffer = ByteBuffer()
+    
     /// Whether certificate hostnames should be validated.
     var validateHostnames: Bool {
         if case .fullVerification = parentContext.configuration.certificateVerification {
@@ -62,10 +82,24 @@ internal final class SSLConnection {
         return false
     }
 
+    // TODO: We need to pass the Set Read and Write Secrets along to our QUIC State Handler (right now we're using the KeyLogCallback which is not it's intended purpose)
     init(ownedSSL: OpaquePointer, parentContext: NIOSSLContext) {
         self.ssl = ownedSSL
         self.parentContext = parentContext
+        
+        if parentContext.mode.isQuic, var quicParams = parentContext.configuration.quicParams {
+            // Register our SSL_QUIC_Method Callbacks / Handlers
+            precondition(CNIOBoringSSL_SSL_set_quic_method(self.ssl, &quicMethods) == 1, "SSLConnection::QUIC Error - Failed to register QUIC Method Handlers")
 
+            // If we're using legacy QUIC params, let BoringSSL know
+            if parentContext.configuration.useLegacyQuicParams {
+                CNIOBoringSSL_SSL_set_quic_use_legacy_codepoint(self.ssl, 1)
+            }
+
+            // Pass our QUIC Params onto BoringSSL
+            precondition(CNIOBoringSSL_SSL_set_quic_transport_params(self.ssl, &quicParams, quicParams.count) == 1, "SSLConnection::QUIC Error - Failed to set QUIC Params")
+        }
+        
         // We pass the SSL object an unowned reference to this object.
         let pointerToSelf = Unmanaged.passUnretained(self).toOpaque()
         CNIOBoringSSL_SSL_set_ex_data(self.ssl, sslConnectionExDataIndex, pointerToSelf)
@@ -267,7 +301,36 @@ internal final class SSLConnection {
     /// peer. It must be immediately followed by an I/O operation, e.g. `readDataFromNetwork`
     /// or `doHandshake` or `doShutdown`.
     func consumeDataFromNetwork(_ data: ByteBuffer) {
-        self.bio!.receiveFromNetwork(buffer: data)
+        switch self.parentContext.mode {
+        case .classic:
+            self.bio!.receiveFromNetwork(buffer: data)
+        case .quic:
+            //var d = Array(data.readableBytesView)
+            // We expect only valid QUIC Crypto Frames (0x06<offset><length><data of length length>)
+            guard var d = data.getQuicCryptoFrame() else {
+                //self.parentHandler?.fireErrorCaught(Errors.invalidQuicCryptoFrame)
+                print("SSLConnection::Invalid QuicCryptoFrame")
+                print(data.readableBytesView.hexString)
+                return
+            }
+            
+            print("SSLConnection::ConsumeDataFromNetwork")
+            print(d.hexString)
+            
+            assert(CNIOBoringSSL_SSL_provide_quic_data(self.ssl, self.epoch, &d, d.count) == 1)
+            
+            if self.epoch == ssl_encryption_handshake {
+                print("Attempting to get Peers Quic Transport Params")
+                var peerParams:UnsafePointer<UInt8>? = nil
+                var peerParamsLength:Int = 0
+                CNIOBoringSSL_SSL_get_peer_quic_transport_params(self.ssl, &peerParams, &peerParamsLength)
+                if peerParamsLength > 0 {
+                    print("Got Peers Quic Transport Params")
+                    let buffer = Array(UnsafeBufferPointer(start: peerParams, count: peerParamsLength))
+                    print(buffer.hexString)
+                }
+            }
+        }
     }
 
     /// Obtains some encrypted data ready for the network from BoringSSL.
@@ -280,7 +343,14 @@ internal final class SSLConnection {
     /// Returns `nil` if there is no data to write. Otherwise, returns all of the pending
     /// data.
     func getDataForNetwork() -> ByteBuffer? {
-        return self.bio!.outboundCiphertext()
+        switch self.parentContext.mode {
+        case .classic:
+            return self.bio!.outboundCiphertext()
+        case .quic:
+            print("GetDataForNetwork Called")
+            guard outboundQueue.readableBytes > 0 else { return nil }
+            return ByteBuffer(bytes: outboundQueue.readBytes(length: outboundQueue.readableBytes)!)
+        }
     }
 
     /// Attempts to decrypt any application data sent by the remote peer, and fills a buffer
@@ -355,7 +425,12 @@ internal final class SSLConnection {
             }
         }
     }
-
+    
+    // This requests the parentHandler (NIOSSLHandler) to perform a flush. That flush then calls `getDataForNetwork` on this connection.
+    func flush() {
+        self.parentHandler!.flush()
+    }
+    
     /// Returns the protocol negotiated via ALPN, if any. Returns `nil` if no protocol
     /// was negotiated.
     func getAlpnProtocol() -> String? {
@@ -426,6 +501,105 @@ internal final class SSLConnection {
         default:
             return nil
         }
+    }
+}
+
+// BoringSSL QUIC Methods
+extension SSLConnection {
+    //set_read_secret: (@convention(c) (OpaquePointer?, ssl_encryption_level_t, OpaquePointer?, UnsafePointer<UInt8>?, Int) -> Int32)!,
+    static func setReadSecret (_ ctx: OpaquePointer?, _ level: ssl_encryption_level_t, _ ptr2: OpaquePointer?, _ ptr3: UnsafePointer<UInt8>?, _ int: Int) -> Int32 {
+        guard let ctx = ctx else { print("set_read_secret called with nil SSLContext"); return 0 }
+        let conn = SSLConnection.loadConnectionFromSSL(ctx)
+        print("SSLConnection::SetReadSecret - Called")
+        //if level.rawValue < conn.epoch.rawValue {
+            print("SSLConnection::Bumping Epoch from \(conn.epoch)[\(conn.epoch.rawValue)] -> \(level)[\(level.rawValue)]")
+            conn.epoch = level
+        //} else {
+        //    print("SSLConnection::‼️ Received a Read Secret for an epoch behind us...")
+        //}
+        return 1
+    }
+    
+    //set_write_secret: (@convention(c) (OpaquePointer?, ssl_encryption_level_t, OpaquePointer?, UnsafePointer<UInt8>?, Int) -> Int32)!,
+    static func setWriteSecret(_ ctx: OpaquePointer?, _ level: ssl_encryption_level_t, _ ptr2: OpaquePointer?, _ ptr3: UnsafePointer<UInt8>?, _ int: Int) -> Int32 {
+        guard let ctx = ctx else { print("set_write_secret called with nil SSLContext"); return 0 }
+        let conn = SSLConnection.loadConnectionFromSSL(ctx)
+        print("SSLConnection::SetWriteSecret - Called")
+        //if level.rawValue < conn.epoch.rawValue {
+            print("SSLConnection::Bumping Epoch from \(conn.epoch)[\(conn.epoch.rawValue)] -> \(level)[\(level.rawValue)]")
+            conn.epoch = level
+        //} else {
+        //    print("SSLConnection::‼️ Received a Write Secret for an epoch behind us...")
+        //}
+        return 1
+    }
+    
+    //add_handshake_data: (@convention(c) (OpaquePointer?, ssl_encryption_level_t, UnsafePointer<UInt8>?, Int) -> Int32)!,
+    static func addHandshakeData(_ ctx: OpaquePointer?, _ level: ssl_encryption_level_t, _ dataPtr: UnsafePointer<UInt8>?, _ length: Int) -> Int32 {
+        guard let ctx = ctx else { print("add_handshake_data called with nil SSLContext"); return 0 }
+        let conn = SSLConnection.loadConnectionFromSSL(ctx)
+        print("SSLConnection::AddHandshakeData - Called")
+        // We prefix the handshake data with a crypto frame header so we can parse / identify this data further up the pipeline
+        // Does this method only get called with complete frames? or should we wait to prefix the data until flushFlight is called?
+        conn.outboundQueue.writeBytes([0x06, 0x00] + writeQuicVarInt(UInt64(length)))
+        conn.outboundQueue.writeBytes(UnsafeBufferPointer<UInt8>(start: dataPtr, count: length))
+        return 1
+    }
+    
+    //flush_flight: (@convention(c) (OpaquePointer?) -> Int32)!,
+    static func flushFlight(_ ctx: OpaquePointer?) -> Int32 {
+        guard let ctx = ctx else { print("flush_flight called with nil SSLContext"); return 0 }
+        let conn = SSLConnection.loadConnectionFromSSL(ctx)
+        print("SSLConnection::FlushFlight - Called")
+        conn.flush()
+        return 1
+    }
+    
+    //send_alert: (@convention(c) (OpaquePointer?, ssl_encryption_level_t, UInt8) -> Int32)!
+    static func sendAlert(_ ctx: OpaquePointer?, _ level: ssl_encryption_level_t, _ int:UInt8) -> Int32 {
+        guard let ctx = ctx else { print("send_alert called with nil SSLContext"); return 0 }
+        let conn = SSLConnection.loadConnectionFromSSL(ctx)
+        print("SSLConnection::SendAlert - Called - \(int)")
+        return 1
+    }
+    
+    // Allows installing Quic Params on inbound connections
+    static func setQuicParams(_ params:[UInt8], ctx: OpaquePointer) {
+        var p = params
+        precondition(CNIOBoringSSL_SSL_set_quic_transport_params(ctx, &p, p.count) == 1)
+    }
+    
+    private static func writeQuicVarInt(_ num: UInt64, minBytes: Int = 0) -> [UInt8] {
+        func getLength(_ bytes: Int) -> UInt8 {
+          switch bytes {
+            case 1: return 0
+            case 2: return 1
+            case 3, 4: return 2
+            case 5...8: return 3
+            default: return 0
+          }
+        }
+
+        var bytes: [UInt8] = num.bytes(minBytes: minBytes)
+        guard !bytes.isEmpty else { return [0] }
+
+        let length = getLength(bytes.count)
+        if (bytes[0] >> 6) == 0 && (minBytes <= bytes.count) {
+          // encode the length in the two available bits
+          bytes[0] ^= (UInt8(length) << 6)
+        } else {
+          // add a new byte to store the length
+          bytes.insert(UInt8(length + 1) << 6, at: 0)
+        }
+        return bytes
+    }
+}
+
+private extension UInt64 {
+    func bytes(minBytes:Int = 0, bigEndian:Bool = true) -> [UInt8] {
+        var bytes = Swift.withUnsafeBytes(of: bigEndian ? self.bigEndian : self.littleEndian, Array.init)
+        while !bytes.isEmpty && bytes[0] == 0 && bytes.count > minBytes { bytes.removeFirst() }
+        return bytes
     }
 }
 
@@ -542,5 +716,46 @@ extension SSLConnection {
         }
 
         return Unmanaged<SSLConnection>.fromOpaque(connectionPointer).takeUnretainedValue()
+    }
+}
+
+private extension ByteBuffer {
+    func getQuicVarInt(at offset: Int) -> (length:Int, value:UInt64)? {
+        // first two bits of the first byte.
+        guard let vByte = self.getBytes(at: offset, length: 1)?.first else { print("GetQuicVarInt::Not Enough Bytes Available"); return nil }
+        var v = UInt64(vByte)
+        let prefix = v >> 6
+        let length = (1 << prefix) - 1
+        
+        // Make sure we have enough bytes before we start forcefully unwrapping below...
+        guard self.readableBytes >= (offset - self.readerIndex) + length else { print("GetQuicVarInt::Not Enough Bytes Available - Offset: \(offset - self.readerIndex) + Length: \(length)"); return nil }
+        
+        // Once the length is known, remove these bits and read any remaining bytes.
+        v = v & 0x3f
+        for i in 0..<length {
+            v = (v << 8) + UInt64(self.getBytes(at: offset + i + 1, length: 1)![0])
+        }
+        
+        return (length + 1, v)
+    }
+    
+    func getQuicCryptoFrame() -> [UInt8]? {
+        guard self.getBytes(at: self.readerIndex, length: 1)?.first == 0x06 else { return nil }
+        guard let offset = self.getQuicVarInt(at: self.readerIndex + 1) else { return nil }
+        guard let length = self.getQuicVarInt(at: self.readerIndex + 1 + offset.length) else { return nil }
+        guard self.readableBytes == 1 + offset.length + length.length + Int(length.value) else { return nil }
+        return self.getBytes(at: self.readerIndex + 1 + offset.length + length.length, length: Int(length.value))
+    }
+}
+
+private extension ByteBufferView {
+    var hexString:String {
+        self.map({ var h = String($0, radix: 16); h = h.count == 1 ? "0"+h : h; return h }).joined()
+    }
+}
+
+private extension Array where Element == UInt8 {
+    var hexString:String {
+        self.map({ var h = String($0, radix: 16); h = h.count == 1 ? "0"+h : h; return h }).joined()
     }
 }
