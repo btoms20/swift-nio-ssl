@@ -308,6 +308,8 @@ public class NIOSSLHandler : ChannelInboundHandler, ChannelOutboundHandler, Remo
     private func completeHandshake(context: ChannelHandlerContext) {
         writeDataToNetwork(context: context, promise: nil)
 
+        if self.connection.isQuic { return }
+        
         // TODO(cory): This event should probably fire out of the BoringSSL info callback.
         let negotiatedProtocol = connection.getAlpnProtocol()
         context.fireUserInboundEventTriggered(TLSUserEvent.handshakeCompleted(negotiatedProtocol: negotiatedProtocol))
