@@ -324,6 +324,12 @@ public struct TLSConfiguration {
     /// This instructs the client which identities can be used by evaluating what CA the identity certificate was issued from.
     public var sendCANameList: Bool
 
+    /// Quic Parameters Extension
+    public var quicParams:[UInt8]? = nil
+    
+    /// Use Legacy Quic Parameters (draft 0 - 30)
+    public var useLegacyQuicParams:Bool = false
+    
     private init(cipherSuiteValues: [NIOTLSCipher] = [],
                  cipherSuites: String = defaultCipherSuites,
                  verifySignatureAlgorithms: [SignatureAlgorithm]?,
@@ -342,7 +348,8 @@ public struct TLSConfiguration {
                  sendCANameList: Bool = false,
                  pskClientCallback: NIOPSKClientIdentityCallback? = nil,
                  pskServerCallback: NIOPSKServerIdentityCallback? = nil,
-                 pskHint: String? = nil) {
+                 pskHint: String? = nil,
+                 quicParams:[UInt8]? = nil) {
         self.cipherSuites = cipherSuites
         self.verifySignatureAlgorithms = verifySignatureAlgorithms
         self.signingSignatureAlgorithms = signingSignatureAlgorithms
@@ -362,6 +369,7 @@ public struct TLSConfiguration {
         self.pskClientCallback = pskClientCallback
         self.pskServerCallback = pskServerCallback
         self.pskHint = pskHint
+        self.quicParams = quicParams
         if !cipherSuiteValues.isEmpty {
             self.cipherSuiteValues = cipherSuiteValues
         }
@@ -413,7 +421,8 @@ extension TLSConfiguration {
             self.sendCANameList == comparing.sendCANameList &&
             isPSKClientCallbackEqual &&
             isPSKServerCallbackEqual &&
-            self.pskHint == comparing.pskHint
+            self.pskHint == comparing.pskHint &&
+            self.quicParams == comparing.quicParams
     }
     
     /// Returns a best effort hash of this TLS configuration.
@@ -446,6 +455,7 @@ extension TLSConfiguration {
             hasher.combine(bytes: closureServerBits)
         }
         hasher.combine(pskHint)
+        hasher.combine(quicParams)
     }
 
     /// Creates a TLS configuration for use with client-side contexts.
@@ -454,7 +464,10 @@ extension TLSConfiguration {
     /// contexts, you should use ``TLSConfiguration/makeServerConfiguration(certificateChain:privateKey:)`` instead.
     ///
     /// For customising fields, modify the returned TLSConfiguration object.
-    public static func makeClientConfiguration() -> TLSConfiguration {
+    public static func makeClientConfiguration(
+        quicParams:[UInt8]? = nil,
+        keyLogCallback:NIOSSLKeyLogCallback? = nil
+    ) -> TLSConfiguration {
         return TLSConfiguration(cipherSuites: defaultCipherSuites,
                                 verifySignatureAlgorithms: nil,
                                 signingSignatureAlgorithms: nil,
@@ -466,13 +479,14 @@ extension TLSConfiguration {
                                 privateKey: nil,
                                 applicationProtocols: [],
                                 shutdownTimeout: .seconds(5),
-                                keyLogCallback: nil,
+                                keyLogCallback: keyLogCallback,
                                 renegotiationSupport: .none,
                                 additionalTrustRoots: [],
                                 sendCANameList: false,
                                 pskClientCallback: nil,
                                 pskServerCallback: nil,
-                                pskHint: nil)
+                                pskHint: nil,
+                                quicParams: quicParams)
     }
 
     /// Create a TLS configuration for use with server-side contexts.
@@ -483,7 +497,9 @@ extension TLSConfiguration {
     /// For customising fields, modify the returned TLSConfiguration object.
     public static func makeServerConfiguration(
         certificateChain: [NIOSSLCertificateSource],
-        privateKey: NIOSSLPrivateKeySource
+        privateKey: NIOSSLPrivateKeySource,
+        quicParams: [UInt8]? = nil,
+        keyLogCallback: NIOSSLKeyLogCallback? = nil
     ) -> TLSConfiguration {
         return TLSConfiguration(cipherSuites: defaultCipherSuites,
                                 verifySignatureAlgorithms: nil,
@@ -496,13 +512,14 @@ extension TLSConfiguration {
                                 privateKey: privateKey,
                                 applicationProtocols: [],
                                 shutdownTimeout: .seconds(5),
-                                keyLogCallback: nil,
+                                keyLogCallback: keyLogCallback,
                                 renegotiationSupport: .none,
                                 additionalTrustRoots: [],
                                 sendCANameList: false,
                                 pskClientCallback: nil,
                                 pskServerCallback: nil,
-                                pskHint: nil)
+                                pskHint: nil,
+                                quicParams: quicParams)
     }
     
     /// Create a TLS configuration for use with server-side or client-side contexts that uses Pre-Shared Keys for TLS 1.2 and below.
