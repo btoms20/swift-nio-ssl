@@ -323,12 +323,6 @@ public struct TLSConfiguration {
     /// Send the CA names derived from the ``trustRoots`` for client authentication.
     /// This instructs the client which identities can be used by evaluating what CA the identity certificate was issued from.
     public var sendCANameList: Bool
-
-    /// Quic Parameters Extension
-    public var quicParams:[UInt8]? = nil
-    
-    /// Use Legacy Quic Parameters (draft 0 - 30)
-    public var useLegacyQuicParams:Bool = false
     
     private init(cipherSuiteValues: [NIOTLSCipher] = [],
                  cipherSuites: String = defaultCipherSuites,
@@ -348,8 +342,7 @@ public struct TLSConfiguration {
                  sendCANameList: Bool = false,
                  pskClientCallback: NIOPSKClientIdentityCallback? = nil,
                  pskServerCallback: NIOPSKServerIdentityCallback? = nil,
-                 pskHint: String? = nil,
-                 quicParams:[UInt8]? = nil) {
+                 pskHint: String? = nil) {
         self.cipherSuites = cipherSuites
         self.verifySignatureAlgorithms = verifySignatureAlgorithms
         self.signingSignatureAlgorithms = signingSignatureAlgorithms
@@ -369,7 +362,6 @@ public struct TLSConfiguration {
         self.pskClientCallback = pskClientCallback
         self.pskServerCallback = pskServerCallback
         self.pskHint = pskHint
-        self.quicParams = quicParams
         if !cipherSuiteValues.isEmpty {
             self.cipherSuiteValues = cipherSuiteValues
         }
@@ -421,8 +413,7 @@ extension TLSConfiguration {
             self.sendCANameList == comparing.sendCANameList &&
             isPSKClientCallbackEqual &&
             isPSKServerCallbackEqual &&
-            self.pskHint == comparing.pskHint &&
-            self.quicParams == comparing.quicParams
+            self.pskHint == comparing.pskHint
     }
     
     /// Returns a best effort hash of this TLS configuration.
@@ -455,7 +446,6 @@ extension TLSConfiguration {
             hasher.combine(bytes: closureServerBits)
         }
         hasher.combine(pskHint)
-        hasher.combine(quicParams)
     }
 
     /// Creates a TLS configuration for use with client-side contexts.
@@ -485,8 +475,7 @@ extension TLSConfiguration {
                                 sendCANameList: false,
                                 pskClientCallback: nil,
                                 pskServerCallback: nil,
-                                pskHint: nil,
-                                quicParams: quicParams)
+                                pskHint: nil)
     }
 
     /// Create a TLS configuration for use with server-side contexts.
@@ -518,8 +507,7 @@ extension TLSConfiguration {
                                 sendCANameList: false,
                                 pskClientCallback: nil,
                                 pskServerCallback: nil,
-                                pskHint: nil,
-                                quicParams: quicParams)
+                                pskHint: nil)
     }
     
     /// Create a TLS configuration for use with server-side or client-side contexts that uses Pre-Shared Keys for TLS 1.2 and below.
