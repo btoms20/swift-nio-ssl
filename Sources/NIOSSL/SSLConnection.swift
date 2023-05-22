@@ -41,6 +41,15 @@ enum AsyncOperationResult<T> {
 /// framing required by TLS. It also records the configuration and parent `NIOSSLContext` object
 /// used to create the connection.
 internal final class SSLConnection {
+    internal enum OperatingMode {
+        case classic
+        case quic
+        
+        var isQuic:Bool {
+            self == .quic
+        }
+    }
+    
     private let ssl: OpaquePointer
     internal let parentContext: NIOSSLContext
     private var bio: ByteBufferBIO?
@@ -59,12 +68,8 @@ internal final class SSLConnection {
     }
     
     internal var epoch:ssl_encryption_level_t = ssl_encryption_initial
-    private var mode:NIOSSLContext.OperatingMode {
-        self.parentContext.mode
-    }
-    internal var isQuic:Bool {
-        self.parentContext.mode.isQuic
-    }
+    internal private(set) var mode:OperatingMode
+    
     private var quicMethods = SSL_QUIC_METHOD(
         set_read_secret: { SSLConnection.setReadSecret($0, $1, $2, $3, $4) },
         set_write_secret: { SSLConnection.setWriteSecret($0, $1, $2, $3, $4) },
@@ -73,6 +78,7 @@ internal final class SSLConnection {
         send_alert: { SSLConnection.sendAlert($0, $1, $2) }
     )
     internal var outboundQueue:ByteBuffer = ByteBuffer()
+    private var quicDelegate:(any NIOSSLQuicDelegate)? = nil
     
     /// Whether certificate hostnames should be validated.
     var validateHostnames: Bool {
@@ -83,22 +89,10 @@ internal final class SSLConnection {
     }
 
     // TODO: We need to pass the Set Read and Write Secrets along to our QUIC State Handler (right now we're using the KeyLogCallback which is not it's intended purpose)
-    init(ownedSSL: OpaquePointer, parentContext: NIOSSLContext) {
+    init(ownedSSL: OpaquePointer, parentContext: NIOSSLContext, quicDelegate:(any NIOSSLQuicDelegate)? = nil) {
         self.ssl = ownedSSL
         self.parentContext = parentContext
-        
-        if parentContext.mode.isQuic, var quicParams = parentContext.configuration.quicParams {
-            // Register our SSL_QUIC_Method Callbacks / Handlers
-            precondition(CNIOBoringSSL_SSL_set_quic_method(self.ssl, &quicMethods) == 1, "SSLConnection::QUIC Error - Failed to register QUIC Method Handlers")
-
-            // If we're using legacy QUIC params, let BoringSSL know
-            if parentContext.configuration.useLegacyQuicParams {
-                CNIOBoringSSL_SSL_set_quic_use_legacy_codepoint(self.ssl, 1)
-            }
-
-            // Pass our QUIC Params onto BoringSSL
-            precondition(CNIOBoringSSL_SSL_set_quic_transport_params(self.ssl, &quicParams, quicParams.count) == 1, "SSLConnection::QUIC Error - Failed to set QUIC Params")
-        }
+        self.mode = .classic
         
         // We pass the SSL object an unowned reference to this object.
         let pointerToSelf = Unmanaged.passUnretained(self).toOpaque()
@@ -108,6 +102,7 @@ internal final class SSLConnection {
     }
     
     deinit {
+        self.quicDelegate = nil
         CNIOBoringSSL_SSL_free(ssl)
     }
 
@@ -207,6 +202,26 @@ internal final class SSLConnection {
             return connection.customVerificationManager!.process(on: connection)
         }
     }
+    
+    func setQuicDelegate(_ delegate:any NIOSSLQuicDelegate) {
+        self.quicDelegate = delegate
+        self.mode = .quic
+            
+        // Register our SSL_QUIC_Method Callbacks / Handlers
+        precondition(CNIOBoringSSL_SSL_set_quic_method(self.ssl, &quicMethods) == 1, "SSLConnection::QUIC Error - Failed to register QUIC Method Handlers")
+
+        // If we're using legacy QUIC params, let BoringSSL know
+        if delegate.useLegacyQuicParams {
+            CNIOBoringSSL_SSL_set_quic_use_legacy_codepoint(self.ssl, 1)
+        }
+
+        // Grab this Connections QUIC Params
+        var quicParams = delegate.ourParams
+        print("SSLConnection:: Injecting QUIC Params into SSL -> \(quicParams.hexString)")
+        
+        // Pass our QUIC Params onto BoringSSL
+        precondition(CNIOBoringSSL_SSL_set_quic_transport_params(self.ssl, &quicParams, quicParams.count) == 1, "SSLConnection::QUIC Error - Failed to set QUIC Params")
+    }
 
     /// Sets whether renegotiation is supported.
     func setRenegotiationSupport(_ state: NIORenegotiationSupport) {
@@ -301,7 +316,7 @@ internal final class SSLConnection {
     /// peer. It must be immediately followed by an I/O operation, e.g. `readDataFromNetwork`
     /// or `doHandshake` or `doShutdown`.
     func consumeDataFromNetwork(_ data: ByteBuffer) {
-        switch self.parentContext.mode {
+        switch self.mode {
         case .classic:
             self.bio!.receiveFromNetwork(buffer: data)
         case .quic:
@@ -326,8 +341,7 @@ internal final class SSLConnection {
                 CNIOBoringSSL_SSL_get_peer_quic_transport_params(self.ssl, &peerParams, &peerParamsLength)
                 if peerParamsLength > 0 {
                     print("Got Peers Quic Transport Params")
-                    let buffer = Array(UnsafeBufferPointer(start: peerParams, count: peerParamsLength))
-                    print(buffer.hexString)
+                    self.quicDelegate?.onPeerParams(params: Array(UnsafeBufferPointer(start: peerParams, count: peerParamsLength)))
                 }
             }
         }
@@ -343,7 +357,7 @@ internal final class SSLConnection {
     /// Returns `nil` if there is no data to write. Otherwise, returns all of the pending
     /// data.
     func getDataForNetwork() -> ByteBuffer? {
-        switch self.parentContext.mode {
+        switch self.mode {
         case .classic:
             return self.bio!.outboundCiphertext()
         case .quic:
@@ -507,30 +521,27 @@ internal final class SSLConnection {
 // BoringSSL QUIC Methods
 extension SSLConnection {
     //set_read_secret: (@convention(c) (OpaquePointer?, ssl_encryption_level_t, OpaquePointer?, UnsafePointer<UInt8>?, Int) -> Int32)!,
-    static func setReadSecret (_ ctx: OpaquePointer?, _ level: ssl_encryption_level_t, _ ptr2: OpaquePointer?, _ ptr3: UnsafePointer<UInt8>?, _ int: Int) -> Int32 {
+    static func setReadSecret (_ ctx: OpaquePointer?, _ level: ssl_encryption_level_t, _ cipherPtr: OpaquePointer?, _ secretPtr: UnsafePointer<UInt8>?, _ secretLength: Int) -> Int32 {
         guard let ctx = ctx else { print("set_read_secret called with nil SSLContext"); return 0 }
         let conn = SSLConnection.loadConnectionFromSSL(ctx)
-        print("SSLConnection::SetReadSecret - Called")
-        //if level.rawValue < conn.epoch.rawValue {
-            print("SSLConnection::Bumping Epoch from \(conn.epoch)[\(conn.epoch.rawValue)] -> \(level)[\(level.rawValue)]")
-            conn.epoch = level
-        //} else {
-        //    print("SSLConnection::‼️ Received a Read Secret for an epoch behind us...")
-        //}
+        if conn.epoch.rawValue < level.rawValue { conn.epoch = level }
+        conn.quicDelegate?.onReadSecret(
+            epoch: level.rawValue,
+            cipherSuite: CNIOBoringSSL_SSL_CIPHER_get_value(cipherPtr),
+            secret: Array(UnsafeBufferPointer<UInt8>(start: secretPtr, count: secretLength))
+        )
         return 1
     }
     
     //set_write_secret: (@convention(c) (OpaquePointer?, ssl_encryption_level_t, OpaquePointer?, UnsafePointer<UInt8>?, Int) -> Int32)!,
-    static func setWriteSecret(_ ctx: OpaquePointer?, _ level: ssl_encryption_level_t, _ ptr2: OpaquePointer?, _ ptr3: UnsafePointer<UInt8>?, _ int: Int) -> Int32 {
+    static func setWriteSecret(_ ctx: OpaquePointer?, _ level: ssl_encryption_level_t, _ cipherPtr: OpaquePointer?, _ secretPtr: UnsafePointer<UInt8>?, _ secretLength: Int) -> Int32 {
         guard let ctx = ctx else { print("set_write_secret called with nil SSLContext"); return 0 }
         let conn = SSLConnection.loadConnectionFromSSL(ctx)
-        print("SSLConnection::SetWriteSecret - Called")
-        //if level.rawValue < conn.epoch.rawValue {
-            print("SSLConnection::Bumping Epoch from \(conn.epoch)[\(conn.epoch.rawValue)] -> \(level)[\(level.rawValue)]")
-            conn.epoch = level
-        //} else {
-        //    print("SSLConnection::‼️ Received a Write Secret for an epoch behind us...")
-        //}
+        conn.quicDelegate?.onWriteSecret(
+            epoch: level.rawValue,
+            cipherSuite: CNIOBoringSSL_SSL_CIPHER_get_value(cipherPtr),
+            secret: Array(UnsafeBufferPointer<UInt8>(start: secretPtr, count: secretLength))
+        )
         return 1
     }
     
