@@ -79,6 +79,7 @@ internal final class SSLConnection {
     )
     internal var outboundQueue:ByteBuffer = ByteBuffer()
     private var quicDelegate:(any NIOSSLQuicDelegate)? = nil
+    private var hasProvidedPeersParams:Bool = false
     
     /// Whether certificate hostnames should be validated.
     var validateHostnames: Bool {
@@ -330,14 +331,15 @@ internal final class SSLConnection {
             
             assert(CNIOBoringSSL_SSL_provide_quic_data(self.ssl, self.epoch, &d, d.count) == 1)
             
-            if self.epoch == ssl_encryption_handshake {
-                print("Attempting to get Peers Quic Transport Params")
-                var peerParams:UnsafePointer<UInt8>? = nil
-                var peerParamsLength:Int = 0
-                CNIOBoringSSL_SSL_get_peer_quic_transport_params(self.ssl, &peerParams, &peerParamsLength)
-                if peerParamsLength > 0 {
-                    print("Got Peers Quic Transport Params")
-                    self.quicDelegate?.onPeerParams(params: Array(UnsafeBufferPointer(start: peerParams, count: peerParamsLength)))
+            if self.hasProvidedPeersParams == false {
+                if self.epoch == ssl_encryption_handshake {
+                    var peerParams:UnsafePointer<UInt8>? = nil
+                    var peerParamsLength:Int = 0
+                    CNIOBoringSSL_SSL_get_peer_quic_transport_params(self.ssl, &peerParams, &peerParamsLength)
+                    if peerParamsLength > 0 {
+                        self.hasProvidedPeersParams = true
+                        self.quicDelegate?.onPeerParams(params: Array(UnsafeBufferPointer(start: peerParams, count: peerParamsLength)))
+                    }
                 }
             }
         }
