@@ -330,9 +330,6 @@ internal final class SSLConnection {
                 return
             }
             
-            print("SSLConnection::ConsumeDataFromNetwork")
-            print(d.hexString)
-            
             assert(CNIOBoringSSL_SSL_provide_quic_data(self.ssl, self.epoch, &d, d.count) == 1)
             
             if self.hasProvidedPeersParams == false {
