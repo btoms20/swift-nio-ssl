@@ -68,14 +68,6 @@ internal final class SSLConnection {
     }
     
     internal var epoch:ssl_encryption_level_t = ssl_encryption_initial
-    private var mode:NIOSSLContext.OperatingMode {
-        self.parentContext.mode
-    }
-    internal var isQuic:Bool {
-        self.parentContext.mode.isQuic
-    }
-    
-    internal var epoch:ssl_encryption_level_t = ssl_encryption_initial
     internal private(set) var mode:OperatingMode
     
     private var quicMethods = SSL_QUIC_METHOD(
