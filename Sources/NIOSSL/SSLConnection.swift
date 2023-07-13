@@ -217,7 +217,7 @@ internal final class SSLConnection {
 
         // Grab this Connections QUIC Params
         var quicParams = delegate.ourParams
-        print("SSLConnection:: Injecting QUIC Params into SSL -> \(quicParams.hexString)")
+        //print("SSLConnection:: Injecting QUIC Params into SSL -> \(quicParams.hexString)")
         
         // Pass our QUIC Params onto BoringSSL
         precondition(CNIOBoringSSL_SSL_set_quic_transport_params(self.ssl, &quicParams, quicParams.count) == 1, "SSLConnection::QUIC Error - Failed to set QUIC Params")
@@ -320,7 +320,6 @@ internal final class SSLConnection {
         case .classic:
             self.bio!.receiveFromNetwork(buffer: data)
         case .quic:
-            //var d = Array(data.readableBytesView)
             // We expect only valid QUIC Crypto Frames (0x06<offset><length><data of length length>)
             guard var d = data.getQuicCryptoFrame() else {
                 //self.parentHandler?.fireErrorCaught(Errors.invalidQuicCryptoFrame)
@@ -328,9 +327,6 @@ internal final class SSLConnection {
                 print(data.readableBytesView.hexString)
                 return
             }
-            
-            print("SSLConnection::ConsumeDataFromNetwork")
-            print(d.hexString)
             
             assert(CNIOBoringSSL_SSL_provide_quic_data(self.ssl, self.epoch, &d, d.count) == 1)
             
@@ -361,7 +357,7 @@ internal final class SSLConnection {
         case .classic:
             return self.bio!.outboundCiphertext()
         case .quic:
-            print("GetDataForNetwork Called")
+            //print("GetDataForNetwork Called")
             guard outboundQueue.readableBytes > 0 else { return nil }
             return ByteBuffer(bytes: outboundQueue.readBytes(length: outboundQueue.readableBytes)!)
         }
