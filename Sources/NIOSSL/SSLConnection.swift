@@ -68,6 +68,14 @@ internal final class SSLConnection {
     }
     
     internal var epoch:ssl_encryption_level_t = ssl_encryption_initial
+    private var mode:NIOSSLContext.OperatingMode {
+        self.parentContext.mode
+    }
+    internal var isQuic:Bool {
+        self.parentContext.mode.isQuic
+    }
+    
+    internal var epoch:ssl_encryption_level_t = ssl_encryption_initial
     internal private(set) var mode:OperatingMode
     
     private var quicMethods = SSL_QUIC_METHOD(
@@ -321,6 +329,7 @@ internal final class SSLConnection {
         case .classic:
             self.bio!.receiveFromNetwork(buffer: data)
         case .quic:
+            //var d = Array(data.readableBytesView)
             // We expect only valid QUIC Crypto Frames (0x06<offset><length><data of length length>)
             guard var d = data.getQuicCryptoFrame() else {
                 //self.parentHandler?.fireErrorCaught(Errors.invalidQuicCryptoFrame)
@@ -328,6 +337,9 @@ internal final class SSLConnection {
                 print(data.readableBytesView.hexString)
                 return
             }
+            
+            print("SSLConnection::ConsumeDataFromNetwork")
+            print(d.hexString)
             
             assert(CNIOBoringSSL_SSL_provide_quic_data(self.ssl, self.epoch, &d, d.count) == 1)
             

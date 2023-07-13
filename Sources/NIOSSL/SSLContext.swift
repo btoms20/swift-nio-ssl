@@ -16,7 +16,7 @@ import NIOCore
 @_implementationOnly import CNIOBoringSSL
 @_implementationOnly import CNIOBoringSSLShims
 
-#if os(macOS) || os(iOS) || os(watchOS) || os(tvOS)
+#if canImport(Darwin)
 import Darwin.C
 #elseif os(Linux) || os(FreeBSD) || os(Android)
 import Glibc
@@ -220,12 +220,30 @@ private func clientPSKCallback(ssl: OpaquePointer?,
 ///
 /// > Warning: Avoid creating ``NIOSSLContext``s on any `EventLoop` because it does _blocking disk I/O_.
 public final class NIOSSLContext {
+    internal enum OperatingMode {
+        case classic
+        case quic
+        
+        var isQuic:Bool {
+            self == .quic
+        }
+    }
+    
     private let sslContext: OpaquePointer
     private let callbackManager: CallbackManagerProtocol?
     private var keyLogManager: KeyLogCallbackManager?
     internal var pskClientConfigurationCallback: NIOPSKClientIdentityCallback?
     internal var pskServerConfigurationCallback: NIOPSKServerIdentityCallback?
     internal let configuration: TLSConfiguration
+    
+    internal let mode:OperatingMode
+    private var quicMethods = SSL_QUIC_METHOD(
+        set_read_secret: { SSLConnection.setReadSecret($0, $1, $2, $3, $4) },
+        set_write_secret: { SSLConnection.setWriteSecret($0, $1, $2, $3, $4) },
+        add_handshake_data: { SSLConnection.addHandshakeData($0, $1, $2, $3) },
+        flush_flight: { SSLConnection.flushFlight($0) },
+        send_alert: { SSLConnection.sendAlert($0, $1, $2) }
+    )
     
     /// Initialize a context that will create multiple connections, all with the same
     /// configuration.
@@ -386,6 +404,15 @@ public final class NIOSSLContext {
         self.sslContext = context
         self.configuration = configuration
         self.callbackManager = callbackManager
+
+        if var quicParams = configuration.quicParams {
+            // If quicParams are set, ensure the minTLSVersion is 1.3
+            // Note: We don't register our QUIC Methods or TransportParams here. NIOSSLContext spawns a new child context for each new connection. The params and method handlers should be installed on the Connection Context
+            precondition(configuration.minimumTLSVersion == .tlsv13, "SSLConnection::QUIC Error - QUIC only supports TLS Versions 1.3 and above")
+            self.mode = .quic
+        } else {
+            self.mode = .classic
+        }
         
         // Always make it possible to get from an SSL_CTX structure back to this.
         let ptrToSelf = Unmanaged.passUnretained(self).toOpaque()
@@ -436,7 +463,7 @@ public final class NIOSSLContext {
         let conn = SSLConnection(ownedSSL: ssl, parentContext: self)
 
         // If we need to turn on the validation on Apple platforms, do it here.
-        #if os(macOS) || os(iOS) || os(watchOS) || os(tvOS)
+        #if canImport(Darwin)
         switch self.configuration.trustRoots {
         case .some(.default), .none:
             conn.setCustomVerificationCallback(CustomVerifyManager(callback: {
@@ -845,7 +872,7 @@ internal class DirectoryContents: Sequence, IteratorProtocol {
     let path: String
     // Used to account between the differences of DIR being defined on Darwin.
     // Otherwise an OpaquePointer needs to be used to account for the non-defined type in glibc.
-    #if os(macOS) || os(iOS) || os(watchOS) || os(tvOS)
+    #if canImport(Darwin)
     let dir: UnsafeMutablePointer<DIR>
     #else
     let dir: OpaquePointer
