@@ -731,13 +731,13 @@ extension SSLConnection {
 private extension ByteBuffer {
     func getQuicVarInt(at offset: Int) -> (length:Int, value:UInt64)? {
         // first two bits of the first byte.
-        guard let vByte = self.getBytes(at: offset, length: 1)?.first else { print("GetQuicVarInt::Not Enough Bytes Available"); return nil }
+        guard let vByte = self.getBytes(at: offset, length: 1)?.first else { print("NIOSSLConnection::GetQuicVarInt::Not Enough Bytes Available"); return nil }
         var v = UInt64(vByte)
         let prefix = v >> 6
         let length = (1 << prefix) - 1
         
         // Make sure we have enough bytes before we start forcefully unwrapping below...
-        guard self.readableBytes >= (offset - self.readerIndex) + length else { print("GetQuicVarInt::Not Enough Bytes Available - Offset: \(offset - self.readerIndex) + Length: \(length)"); return nil }
+        guard self.readableBytes >= (offset - self.readerIndex) + length else { print("NIOSSLConnection::GetQuicVarInt::Not Enough Bytes Available - Offset: \(offset - self.readerIndex) + Length: \(length)"); return nil }
         
         // Once the length is known, remove these bits and read any remaining bytes.
         v = v & 0x3f
